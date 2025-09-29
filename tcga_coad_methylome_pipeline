@@ -1,0 +1,535 @@
+# TCGA-COAD DNA methylation analysis pipeline
+# Combined R script from all code blocks
+# This script includes:
+#   - Data download & preparation
+#   - EDA (density, PCA, heatmap)
+#   - Differential methylation analysis (limma)
+#   - Bumphunter DMR analysis
+#   - SVA adjustment and GAM smoothing
+#   - Cell composition analysis
+#   - Machine learning predictive modelling
+# Author: Dr. Matthew Iwada Ekum
+
+# NOTE: Ensure required Bioconductor and CRAN packages are installed before running.
+
+# ---------------------------
+#!/usr/bin/env Rscript
+## tcga_coad_methylome_pipeline.R
+## End-to-end TCGA–COAD methylome analysis (EDA → limma → DMRs → SVA-lite → GAM → ML)
+## Outputs: ./figs/*.pdf, ./figs/ml_performance.csv, caches in ./GDCdata/*.rds
+
+suppressPackageStartupMessages({
+  if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  for (p in c(
+    "TCGAbiolinks","SummarizedExperiment","GenomicRanges","IRanges",
+    "matrixStats","ggplot2","pheatmap","RColorBrewer","limma","dplyr","tibble",
+    "mgcv","irlba","bumphunter","ranger","xgboost","nnet","pROC","minfi"
+  )) { if (!requireNamespace(p, quietly = TRUE)) {
+      tryCatch({
+        if (p %in% c("TCGAbiolinks","SummarizedExperiment","GenomicRanges","IRanges","bumphunter","minfi"))
+          BiocManager::install(p, ask = FALSE, update = FALSE)
+        else install.packages(p)
+      }, error=function(e) message("Install hint for package ", p, ": ", e$message))
+  }}
+})
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(GenomicRanges)
+library(matrixStats)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(limma)
+library(dplyr)
+library(tibble)
+library(mgcv)
+library(irlba)
+library(bumphunter)
+library(ranger)
+library(xgboost)
+library(nnet)
+library(pROC)
+
+set.seed(123)
+options(stringsAsFactors = FALSE)
+dir.create("figs", showWarnings = FALSE)
+dir.create("GDCdata", showWarnings = FALSE)
+
+## ---------------- CLI args ----------------
+args <- commandArgs(trailingOnly = TRUE)
+get_arg <- function(key, default) {
+  hit <- grep(paste0("^--", key, "="), args, value = TRUE)
+  if (length(hit) == 0) return(default)
+  sub(paste0("^--", key, "="), "", hit[1])
+}
+B_perms   <- as.integer(get_arg("B", "200"))        # use 1000 for manuscript figs
+subset_n  <- as.integer(get_arg("subset_n", "0"))   # small subset for smoke tests (0 = full)
+
+message("Settings: B=", B_perms, " | subset_n=", subset_n)
+
+## ---------------- Utilities ----------------
+as_M <- function(beta, eps=1e-6) {
+  beta <- pmin(pmax(beta, eps), 1 - eps)
+  log2(beta/(1-beta))
+}
+save_pdf <- function(path, code) { pdf(path); on.exit(dev.off(), add=TRUE); force(code) }
+
+## ---------------- 1) Data ----------------
+se_rds <- file.path("GDCdata","tcga_coad_450k_se.rds")
+if (file.exists(se_rds)) {
+  se <- readRDS(se_rds)
+} else {
+  query <- GDCquery(
+    project      = "TCGA-COAD",
+    data.category = "DNA Methylation",
+    data.type     = "Methylation Beta Value",
+    platform      = "Illumina Human Methylation 450",
+    sample.type   = c("Primary Tumor","Solid Tissue Normal")
+  )
+  if (subset_n > 0 && nrow(query$results[[1]]) > subset_n) {
+    query$results[[1]] <- query$results[[1]][seq_len(subset_n), , drop = FALSE]
+  }
+  GDCdownload(query, method = "api", files.per.chunk = 10, directory = "GDCdata")
+  se <- GDCprepare(query, directory = "GDCdata")
+  saveRDS(se, se_rds)
+}
+
+stopifnot(inherits(se,"RangedSummarizedExperiment"))
+assayNames(se) <- "Beta"
+beta  <- as.matrix(assay(se, "Beta"))   # CpGs x samples
+pheno <- as.data.frame(colData(se))
+rownames(pheno) <- colnames(beta)
+if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
+  pheno$CancerStatus <- factor(ifelse(pheno$sample_type=="Solid Tissue Normal","Normal","Cancer"),
+                               levels=c("Normal","Cancer"))
+}
+
+## ---------------- 2) EDA ----------------
+# 2.1 Density
+{
+  grid <- seq(0,1,length.out=256)
+  cols_cs <- c(Normal="#1f77b4", Cancer="#d62728")
+  dens_list <- lapply(seq_len(ncol(beta)), function(j){
+    x <- as.numeric(beta[,j]); x <- x[is.finite(x)]
+    dj <- density(x, from=0, to=1, n=length(grid))
+    data.frame(Sample=colnames(beta)[j], x=dj$x, y=dj$y,
+               CancerStatus=pheno[colnames(beta)[j],"CancerStatus",drop=TRUE])
+  })
+  df_dens <- bind_rows(dens_list)
+  save_pdf("figs/density.pdf", {
+    print(
+      ggplot(df_dens, aes(x=x, y=y, group=Sample, color=CancerStatus)) +
+        geom_line(alpha=.35, linewidth=.4) +
+        scale_color_manual(values = cols_cs, na.translate = FALSE) +
+        labs(x=expression(beta~"value"), y="Density",
+             title="Density of DNA methylation \u03B2-values per sample") +
+        theme_minimal(base_size=12) + theme(legend.position="top")
+    )
+  })
+}
+
+# 2.2 PCA (top-variable CpGs)
+{
+  row_fin <- rowMeans(is.finite(beta)); col_fin <- colMeans(is.finite(beta))
+  beta1  <- beta[row_fin>=0.10 | is.na(row_fin), col_fin>=0.50 | is.na(col_fin), drop=FALSE]
+  pheno1 <- pheno[colnames(beta1),,drop=FALSE]
+  rmed <- rowMedians(beta1, na.rm=TRUE); gmed <- median(beta1[is.finite(beta1)])
+  if (!is.finite(gmed)) gmed <- 0.5
+  rmed[!is.finite(rmed)] <- gmed
+  idx <- which(!is.finite(beta1), arr.ind=TRUE); if (nrow(idx)>0) beta1[idx] <- rmed[idx[,1]]
+  vars <- rowVars(beta1); ord <- order(vars, decreasing=TRUE); k <- min(10000L, length(ord))
+  beta_top <- beta1[ord[seq_len(k)],,drop=FALSE]
+  beta_top <- sweep(beta_top, 1, rowMeans(beta_top), "-")
+  beta_top <- beta_top[rowSds(beta_top)>1e-8,,drop=FALSE]
+  pca <- prcomp(t(beta_top), center=TRUE, scale.=FALSE)
+  var_expl <- 100*(pca$sdev^2/sum(pca$sdev^2))
+  pc_df <- data.frame(Sample=rownames(pca$x), PC1=pca$x[,1], PC2=pca$x[,2],
+                      CancerStatus=pheno1[rownames(pca$x),"CancerStatus",drop=TRUE])
+  save_pdf("figs/pca.pdf", {
+    print(
+      ggplot(pc_df, aes(PC1,PC2,color=CancerStatus))+
+        geom_point(size=2,alpha=.85)+
+        scale_color_manual(values=c(Normal="#1f77b4",Cancer="#d62728"))+
+        labs(title="PCA of methylation (top-variable CpGs)",
+             x=sprintf("PC1 (%.1f%%)", var_expl[1]),
+             y=sprintf("PC2 (%.1f%%)", var_expl[2]))+
+        theme_minimal(base_size=12)+theme(legend.position="top")
+    )
+  })
+}
+
+# 2.3 Heatmap (top 1000 CpGs)
+{
+  vars <- rowVars(beta1); ord <- order(vars, decreasing=TRUE)
+  k_hm <- min(1000L, length(ord))
+  hm   <- beta1[ord[seq_len(k_hm)],,drop=FALSE]
+  rmn <- rowMeans(hm); rsd <- rowSds(hm); rsd[rsd<1e-8] <- 1
+  hm_z <- (hm - rmn)/rsd
+  ann  <- data.frame(CancerStatus = pheno1[colnames(hm_z),"CancerStatus",drop=TRUE])
+  rownames(ann) <- colnames(hm_z)
+  ann_colors <- list(CancerStatus=c(Normal="#1f77b4",Cancer="#d62728"))
+  hm_cols <- colorRampPalette(c("#2166AC","#F7F7F7","#B2182B"))(255)
+  pdf("figs/heatmap.pdf", width=8.5, height=10)
+  pheatmap(hm_z, color=hm_cols, border_color=NA, show_rownames=FALSE, show_colnames=FALSE,
+           clustering_distance_rows="euclidean", clustering_method="ward.D2",
+           clustering_distance_cols="euclidean", scale="none",
+           annotation_col=ann, annotation_colors=ann_colors,
+           fontsize=10, cutree_rows=6, cutree_cols=3)
+  dev.off()
+}
+
+## ---------------- 3) limma per-CpG ----------------
+{
+  beta_f <- beta[rowMeans(is.finite(beta))>=0.80,,drop=FALSE]
+  M      <- as_M(beta_f)
+  design <- model.matrix(~ CancerStatus, data=pheno)
+  coef_name <- "CancerStatusCancer"
+  fit  <- lmFit(M, design)
+  fit  <- eBayes(fit, trend=TRUE, robust=TRUE)
+  tt   <- topTable(fit, coef=coef_name, number=Inf, sort.by="P") %>% rownames_to_column("CpG")
+  write.csv(tt, file="figs/limma_per_cpg_results.csv", row.names=FALSE)
+
+  # Volcano
+  volc <- tt %>% mutate(minusLog10P = -log10(P.Value), sig = adj.P.Val < 0.05)
+  save_pdf("figs/volcano.pdf", {
+    print(
+      ggplot(volc, aes(logFC, minusLog10P, color=sig))+
+        geom_point(alpha=.6, size=1.2)+
+        scale_color_manual(values=c(`TRUE`="#d62728",`FALSE`="grey60"),
+                           labels=c(`TRUE`="FDR < 0.05",`FALSE`="NS"), name=NULL)+
+        labs(title="Per-CpG differential methylation (Tumor vs Normal)",
+             x="Effect size (log2 M-value fold-change; Cancer vs Normal)",
+             y=expression(-log[10](p)))+
+        theme_minimal(base_size=12)+theme(legend.position="top")
+    )
+  })
+
+  # Manhattan (if coordinates available)
+  coords <- try({
+    rr <- rowRanges(se); tibble(CpG=names(rr),
+                                chr=as.character(seqnames(rr)),
+                                pos=as.numeric(start(rr)))
+  }, silent=TRUE)
+  if (!inherits(coords,"try-error")) {
+    ann <- coords %>% filter(CpG %in% tt$CpG)
+    man <- volc %>% inner_join(ann, by="CpG") %>%
+      mutate(chr=gsub("^chr","",chr,ignore.case=TRUE),
+             chr=ifelse(chr%in%c("X","x"),"23",ifelse(chr%in%c("Y","y"),"24",chr)),
+             chr=suppressWarnings(as.integer(chr))) %>% filter(!is.na(chr))
+    if (nrow(man)>0) {
+      chr_lengths <- man %>% group_by(chr) %>% summarise(chr_len=max(as.numeric(pos)), .groups="drop") %>% arrange(chr)
+      chr_offsets <- chr_lengths %>% mutate(chr_start=lag(cumsum(as.numeric(chr_len)), default=0)) %>% select(chr, chr_start)
+      man <- man %>% left_join(chr_offsets, by="chr") %>% mutate(pos_cum=as.numeric(pos)+as.numeric(chr_start),
+                                                                 colgrp=factor(chr%%2))
+      axis_df <- man %>% group_by(chr) %>% summarise(center=mean(range(pos_cum, na.rm=TRUE)), .groups="drop") %>%
+        arrange(chr) %>% mutate(lab=case_when(chr==23~"X", chr==24~"Y", TRUE~as.character(chr)))
+      save_pdf("figs/manhattan.pdf", {
+        print(
+          ggplot(man, aes(pos_cum, -log10(P.Value)))+
+            geom_point(aes(color=colgrp), size=.4, alpha=.7)+
+            scale_color_manual(values=c("#8888aa","#aaaa88"), guide="none")+
+            labs(title="Genomic distribution of CpG associations",
+                 x="Genomic position (by chromosome)", y=expression(-log[10](p)))+
+            scale_x_continuous(breaks=axis_df$center, labels=axis_df$lab)+
+            theme_minimal(base_size=11)+
+            theme(panel.grid.major.x=element_blank(), panel.grid.minor.x=element_blank())+
+            geom_point(data=subset(man, adj.P.Val<0.05), color="#d62728", size=.6, alpha=.6)
+        )
+      })
+    }
+  }
+
+  assign("M", M, envir=.GlobalEnv)          # reuse downstream
+  assign("tt_df", tt, envir=.GlobalEnv)
+}
+
+## ---------------- 4) Bumphunter (DMRs) + null ----------------
+{
+  rr <- rowRanges(se)
+  coords <- tibble(CpG=names(rr), chr=as.character(seqnames(rr)), pos=as.integer(start(rr)))
+  keep <- coords$CpG %in% rownames(M)
+  coords <- coords[keep,,drop=FALSE]; M2 <- M[coords$CpG,,drop=FALSE]
+  clusters <- bumphunter::clusterMaker(chr = coords$chr, pos = coords$pos, maxGap = 500L)
+  design <- model.matrix(~ CancerStatus, data=pheno[colnames(M2),,drop=FALSE])
+  coef_idx <- which(colnames(design)=="CancerStatusCancer")
+  set.seed(123)
+  bh <- bumphunter::bumphunter(
+    object=M2, design=design, coef=coef_idx,
+    chr=coords$chr, pos=coords$pos, cluster=clusters,
+    cutoff=0.25, B=B_perms, smooth=TRUE, nullMethod="perm"
+  )
+  saveRDS(bh, file="GDCdata/bh.rds")
+
+  # Regions overview plot
+  tab <- bh$table
+  if (!is.null(tab) && nrow(tab)>0) {
+    tab <- tab %>% mutate(dir=ifelse(value>=0,"Hypermethylated","Hypomethylated"),
+                          chr=sub("^chr","",as.character(chr), ignore.case=TRUE))
+    tab <- tab %>% group_by(chr) %>% arrange(start, .by_group=TRUE) %>% mutate(idx=row_number()) %>% ungroup()
+    save_pdf("figs/bumps.pdf", {
+      print(
+        ggplot(tab, aes(x=start, xend=end, y=idx, yend=idx, color=dir))+
+          geom_segment(lineend="round")+
+          scale_color_manual(values=c(Hypomethylated="#1f77b4",Hypermethylated="#d62728"))+
+          facet_wrap(~chr, scales="free_x", ncol=6)+
+          labs(title="Bumphunter regions by chromosome",
+               x="Genomic position (bp)", y="Region index within chromosome")+
+          theme_minimal(base_size=11)+
+          theme(panel.grid.major.y=element_blank(), panel.grid.minor=element_blank(),
+                legend.position="top")
+      )
+    })
+  } else {
+    save_pdf("figs/bumps.pdf", { plot.new(); title("Bumphunter regions"); text(.5,.5,"No regions detected.") })
+  }
+
+  # Permutation null histogram
+  null_vec <- NULL
+  for (nm in c("null","nullDistribution","nullDist","null.value")) {
+    if (!is.null(bh[[nm]])) { null_vec <- bh[[nm]]; break }
+  }
+  if (is.list(null_vec)) null_vec <- unlist(null_vec, use.names=FALSE)
+  obs_area <- if (!is.null(tab) && "area" %in% names(tab)) max(abs(tab$area), na.rm=TRUE) else NA_real_
+  if (!is.null(null_vec)) {
+    df_null <- data.frame(area = as.numeric(null_vec))
+    save_pdf("figs/null.pdf", {
+      g <- ggplot(df_null, aes(area)) + geom_histogram(bins = max(20, min(80, length(null_vec)/2)),
+                                                       fill="grey75", color="grey35") +
+        labs(title=sprintf("Permutation null of bump areas (B = %d)", B_perms),
+             x="Permutation max bump area", y="Count") + theme_minimal(base_size=12)
+      if (is.finite(obs_area)) g <- g + geom_vline(xintercept = obs_area, color="#d62728", linewidth=1)
+      print(g)
+    })
+  }
+  assign("coords_df", coords, envir=.GlobalEnv)
+}
+
+## ---------------- 5) SVA-lite p-value hist ----------------
+{
+  design <- model.matrix(~ CancerStatus, data=pheno)
+  coef_idx <- which(colnames(design)=="CancerStatusCancer")
+  Mfull <- as_M(beta)
+  keep <- rowMeans(is.finite(Mfull))>=0.80; Mfull <- Mfull[keep,,drop=FALSE]
+  rmed <- rowMedians(Mfull, na.rm=TRUE); na_id <- which(!is.finite(Mfull), arr.ind=TRUE)
+  if (nrow(na_id)>0) Mfull[na_id] <- rmed[na_id[,1]]
+  rv <- rowVars(Mfull); Mfull <- Mfull[rv>1e-8,,drop=FALSE]
+
+  fit_pre <- eBayes(lmFit(Mfull, design), trend=TRUE, robust=TRUE)
+  p_pre   <- fit_pre$p.value[,coef_idx]
+
+  H <- design %*% solve(crossprod(design)) %*% t(design)
+  M_res <- t( (diag(nrow(H)) - H) %*% t(Mfull) )
+  k <- min(5L, max(2L, floor(ncol(M_res)/20)))
+  SVs <- irlba::prcomp_irlba(t(M_res), n=k, center=TRUE, scale.=FALSE)$x
+  colnames(SVs) <- paste0("SV", seq_len(ncol(SVs)))
+  fit_post <- eBayes(lmFit(Mfull, cbind(design, SVs)), trend=TRUE, robust=TRUE)
+  p_post   <- fit_post$p.value[,coef_idx]
+
+  dfp <- rbind(data.frame(p=p_pre, which="Pre-SV"),
+               data.frame(p=p_post, which="Post-SV"))
+  dfp <- subset(dfp, is.finite(p) & p>=0 & p<=1)
+  save_pdf("figs/p_hist_pre_post_sva.pdf", {
+    print(
+      ggplot(dfp, aes(p, fill=which)) +
+        geom_histogram(position="identity", bins=40, alpha=.6) +
+        scale_fill_manual(values=c("Pre-SV"="grey60","Post-SV"="#d62728")) +
+        coord_cartesian(xlim=c(0,1)) +
+        labs(x="p-value", y="Count", title="p-value histograms before and after fast SVA adjustment") +
+        theme_minimal(base_size=12) + theme(legend.position="top")
+    )
+  })
+}
+
+## ---------------- 6) GAM locus visual ----------------
+{
+  stopifnot(exists("tt_df"), exists("coords_df"))
+  df <- tt_df %>% inner_join(coords_df, by="CpG") %>% filter(is.finite(logFC), is.finite(pos))
+  sig_df <- df %>% mutate(sig = adj.P.Val < 0.05)
+  if (sum(sig_df$sig, na.rm=TRUE) >= 5) {
+    best_chr <- sig_df %>% filter(sig) %>% count(chr, sort=TRUE) %>% slice(1) %>% pull(chr)
+  } else best_chr <- df %>% count(chr, sort=TRUE) %>% slice(1) %>% pull(chr)
+  df_chr <- df %>% filter(chr==best_chr)
+  center_pos <- if (sum(df_chr$adj.P.Val<0.05, na.rm=TRUE) >= 5)
+                  median(df_chr$pos[df_chr$adj.P.Val<0.05], na.rm=TRUE) else median(df_chr$pos, na.rm=TRUE)
+  win <- 250000
+  region <- c(max(min(df_chr$pos), center_pos - win), min(max(df_chr$pos), center_pos + win))
+  df_reg <- df_chr %>% filter(pos>=region[1], pos<=region[2]) %>% arrange(pos)
+  if (nrow(df_reg) >= 50) {
+    df_reg <- df_reg %>% mutate(se=pmax(1e-6, abs(logFC/t)), wts=1/(se^2), pos_mb=pos/1e6)
+    gfit <- mgcv::gam(logFC ~ s(pos_mb, k=50), data=df_reg, weights=wts, method="REML")
+    newx <- data.frame(pos_mb = seq(min(df_reg$pos_mb), max(df_reg$pos_mb), length.out=400))
+    pr   <- predict(gfit, newdata=newx, se.fit=TRUE)
+    newx$fit <- as.numeric(pr$fit); newx$lo <- newx$fit - 1.96*as.numeric(pr$se.fit); newx$hi <- newx$fit + 1.96*as.numeric(pr$se.fit)
+    save_pdf("figs/gam_smooth.pdf", {
+      print(
+        ggplot()+
+          geom_point(data=df_reg, aes(pos_mb, logFC), size=.6, alpha=.35)+
+          geom_ribbon(data=newx, aes(pos_mb, ymin=lo, ymax=hi), alpha=.20)+
+          geom_line(data=newx, aes(pos_mb, fit), linewidth=1)+
+          labs(title=sprintf("GAM smooth of methylation effects (%s, ~%.0f–%.0f kb)",
+                             as.character(best_chr), 1000*min(df_reg$pos_mb), 1000*max(df_reg$pos_mb)),
+               x="Genomic position (Mb)", y="Effect size (logFC; Cancer vs Normal)")+
+          theme_minimal(base_size=12)
+      )
+    })
+  }
+}
+
+## ---------------- 7) Cell composition (age effect) ----------------
+{
+  # Find an age column
+  age_cols <- intersect(colnames(pheno),
+                        c("paper_age_at_diagnosis","age_at_diagnosis","age_at_index","age","years_to_birth","paper_age"))
+  if (length(age_cols)>0) {
+    ph <- pheno
+    ph$Age <- suppressWarnings(as.numeric(ph[[age_cols[1]]]))
+    keep <- is.finite(ph$Age)
+    if (sum(keep) > 40) {
+      beta_k <- beta[,keep,drop=FALSE]; M_k <- as_M(beta_k); ph_k <- ph[keep,,drop=FALSE]
+      # PC proxies if minfi deconv fails
+      cell_frac <- NULL
+      try({
+        grSet <- minfi::makeGenomicRatioSetFromMatrix(beta_k, pData=ph_k, what="Beta",
+                    array="IlluminaHumanMethylation450k", annotation=c("ilmn12.hg19"))
+        if (!requireNamespace("FlowSorted.Blood.450k", quietly=TRUE))
+          BiocManager::install("FlowSorted.Blood.450k", ask=FALSE, update=FALSE)
+        cell_frac <- minfi::estimateCellCounts2(grSet,
+                      compositeCellType="Blood",
+                      processMethod="auto",
+                      referenceset=FlowSorted.Blood.450k::FlowSorted.Blood.450k) |> as.data.frame()
+      }, silent=TRUE)
+      if (is.null(cell_frac)) {
+        rv <- rowVars(M_k, na.rm=TRUE); ord <- order(rv, decreasing=TRUE)
+        k  <- min(10000L, length(ord)); Mtop <- M_k[ord[seq_len(k)],,drop=FALSE]
+        rmed <- rowMedians(Mtop, na.rm=TRUE); idx <- which(!is.finite(Mtop), arr.ind=TRUE)
+        if (nrow(idx)>0) Mtop[idx] <- rmed[idx[,1]]
+        Mtop <- sweep(Mtop, 1, rowMeans(Mtop), "-")
+        pcs  <- prcomp(t(Mtop), center=TRUE, scale.=FALSE)$x
+        cell_frac <- as.data.frame(pcs[,1:5,drop=FALSE]); colnames(cell_frac) <- paste0("PC",1:ncol(cell_frac))
+        rownames(cell_frac) <- colnames(M_k)
+      }
+      # pick CpGs with pre-adjust age association
+      rv <- rowVars(M_k, na.rm=TRUE); ord <- order(rv, decreasing=TRUE); k <- min(5000L, length(ord))
+      Msub <- M_k[ord[seq_len(k)],,drop=FALSE]; age_z <- scale(ph_k$Age)
+      pre_p <- rep(NA_real_, nrow(Msub))
+      for (i in seq_len(nrow(Msub))) {
+        y <- Msub[i,]; ok <- is.finite(y)
+        if (sum(ok)>30) pre_p[i] <- tryCatch(coef(summary(lm(y ~ age_z, na.action=na.exclude)))[2,4], error=function(e) NA_real_)
+      }
+      cpg_pick <- rownames(Msub)[order(pre_p, na.last=NA)][seq_len(min(6, sum(is.finite(pre_p))))]
+      plot_df <- bind_rows(lapply(cpg_pick, function(cpg){
+        tibble(CpG=cpg, Age=ph_k$Age, Mval=as.numeric(M_k[cpg,]), CancerStatus=ph_k$CancerStatus)
+      }))
+      fit_lines <- bind_rows(lapply(cpg_pick, function(cpg){
+        y <- as.numeric(M_k[cpg,])
+        d1 <- data.frame(Age=ph_k$Age); ok1 <- is.finite(y) & complete.cases(d1)
+        pre  <- tryCatch(lm(y ~ scale(Age), data=d1, subset=ok1), error=function(e) NULL)
+        d2 <- cbind(Age=ph_k$Age, CancerStatus=ph_k$CancerStatus, cell_frac)
+        ok2 <- is.finite(y) & complete.cases(d2)
+        post <- tryCatch(lm(y ~ scale(Age) + CancerStatus + ., data=d2, subset=ok2), error=function(e) NULL)
+        newX <- data.frame(Age = seq(min(ph_k$Age,na.rm=TRUE), max(ph_k$Age,na.rm=TRUE), length.out=80))
+        out <- tibble()
+        if (!is.null(pre))
+          out <- bind_rows(out, tibble(CpG=cpg, Age=newX$Age, fit=predict(pre, newdata=newX), Model="Pre: Age only"))
+        if (!is.null(post)) {
+          newX2 <- cbind(newX, CancerStatus=factor("Normal", levels=levels(ph_k$CancerStatus)),
+                         as.data.frame(lapply(cell_frac, mean, na.rm=TRUE)))
+          out <- bind_rows(out, tibble(CpG=cpg, Age=newX$Age, fit=predict(post, newdata=newX2), Model="Post: + composition"))
+        }
+        out
+      }))
+      save_pdf("figs/cell_composition.pdf", {
+        print(
+          ggplot(plot_df, aes(Age, Mval, color=CancerStatus))+
+            geom_point(alpha=.35, size=.7)+
+            geom_line(data=fit_lines, aes(Age, fit, linetype=Model, color=NULL), linewidth=1)+
+            scale_linetype_manual(values=c("Pre: Age only"="dashed", "Post: + composition"="solid"))+
+            scale_color_manual(values=c(Normal="#1f77b4", Cancer="#d62728"))+
+            facet_wrap(~CpG, ncol=3, scales="free_y")+
+            labs(title="Apparent age effects before vs after cellular composition adjustment",
+                 x="Age (years)", y="M-value (log2 Beta/(1-Beta))",
+                 color="Status", linetype=NULL)+
+            theme_minimal(base_size=11)+theme(legend.position="top")
+        )
+      })
+    }
+  }
+}
+
+## ---------------- 8) Predictive modelling ----------------
+{
+  # features = PCs (1..10); optional limma-score (not included in formal comparison table)
+  beta_all <- beta1  # from PCA stage
+  pca2 <- prcomp(t(beta_top), center=TRUE, scale.=FALSE)  # reuse top matrix
+  Xpc <- as.data.frame(pca2$x[,1:10,drop=FALSE]); colnames(Xpc) <- paste0("PC",1:ncol(Xpc))
+  y <- factor(pheno1[rownames(Xpc),"CancerStatus",drop=TRUE], levels=c("Normal","Cancer"))
+  # limma-score
+  tt <- read.csv("figs/limma_per_cpg_results.csv", stringsAsFactors=FALSE)
+  rownames(tt) <- tt$CpG
+  M_full <- as_M(beta)
+  sig_cpgs <- rownames(tt)[order(tt$adj.P.Val)][seq_len(min(100, nrow(tt)))]
+  sig_cpgs <- sig_cpgs[sig_cpgs %in% rownames(M_full)]
+  Xsig <- if (length(sig_cpgs)>=10) {
+    sgn <- sign(tt[sig_cpgs,"logFC"])
+    sc  <- colMeans(t(M_full[sig_cpgs, colnames(M_full) %in% rownames(Xpc), drop=FALSE]) * sgn, na.rm=TRUE)
+    data.frame(LimmaScore = as.numeric(sc[rownames(Xpc)]))
+  } else data.frame(LimmaScore = rep(0, nrow(Xpc)))
+
+  # split
+  idx_by_y <- split(seq_len(nrow(Xpc)), y)
+  train_idx <- unlist(lapply(idx_by_y, function(v) sample(v, floor(0.7*length(v)))))
+  test_idx  <- setdiff(seq_len(nrow(Xpc)), train_idx)
+  xtr <- Xpc[train_idx,,drop=FALSE]; xte <- Xpc[test_idx,,drop=FALSE]
+  ytr <- y[train_idx]; yte <- y[test_idx]
+  ytr_num <- as.numeric(ytr=="Cancer"); yte_num <- as.numeric(yte=="Cancer")
+  rmse <- function(p,y) sqrt(mean((p-y)^2))
+
+  # Logistic (PCs)
+  glm_fit <- glm(ytr_num ~ ., data=cbind.data.frame(ytr_num, xtr), family=binomial())
+  p_glm <- predict(glm_fit, newdata=xte, type="response")
+  auc_glm <- as.numeric(pROC::roc(yte, p_glm, quiet=TRUE)$auc)
+  rmse_glm <- rmse(p_glm, yte_num); brier_glm <- mean((p_glm-yte_num)^2)
+
+  # Random Forest (PCs + score)
+  xtr_pcl <- cbind(xtr, Xsig[train_idx,,drop=FALSE]); xte_pcl <- cbind(xte, Xsig[test_idx,,drop=FALSE])
+  rf_fit <- ranger::ranger(dependent.variable.name="y",
+                           data=data.frame(y=ytr, xtr_pcl),
+                           probability=TRUE, num.trees=500,
+                           mtry=max(2, floor(sqrt(ncol(xtr_pcl)))),
+                           min.node.size=5, seed=123)
+  pr_rf <- predict(rf_fit, data.frame(xte_pcl))$predictions[,"Cancer"]
+  auc_rf <- as.numeric(pROC::roc(yte, pr_rf, quiet=TRUE)$auc)
+  rmse_rf <- rmse(pr_rf, yte_num); brier_rf <- mean((pr_rf-yte_num)^2)
+
+  # XGBoost (PCs)
+  dtr <- xgboost::xgb.DMatrix(as.matrix(xtr), label=ytr_num)
+  dte <- xgboost::xgb.DMatrix(as.matrix(xte), label=yte_num)
+  param <- list(objective="binary:logistic", eval_metric="logloss", max_depth=3, eta=0.08,
+                subsample=0.8, colsample_bytree=0.8)
+  xgb_fit <- xgboost::xgb.train(params=param, data=dtr, nrounds=400, verbose=0)
+  p_xgb <- predict(xgb_fit, dte)
+  auc_xgb <- as.numeric(pROC::roc(yte, p_xgb, quiet=TRUE)$auc)
+  rmse_xgb <- rmse(p_xgb, yte_num); brier_xgb <- mean((p_xgb-yte_num)^2)
+
+  # Neural net (PCs)
+  nn_fit <- nnet::nnet(x=as.matrix(xtr), y=ytr_num, size=5, rang=0.05, decay=5e-4,
+                       maxit=400, trace=FALSE)
+  p_nn <- as.numeric(predict(nn_fit, as.matrix(xte), type="raw"))
+  auc_nn <- as.numeric(pROC::roc(yte, p_nn, quiet=TRUE)$auc)
+  rmse_nn <- rmse(p_nn, yte_num); brier_nn <- mean((p_nn-yte_num)^2)
+
+  perf <- data.frame(
+    Model = c("Logistic regression (PCs)","Random Forest (PCs+score)",
+              "XGBoost (PCs)","Neural Network (PCs)"),
+    AUC   = c(auc_glm, auc_rf, auc_xgb, auc_nn),
+    RMSE  = c(rmse_glm, rmse_rf, rmse_xgb, rmse_nn),
+    Brier = c(brier_glm, brier_rf, brier_xgb, brier_nn)
+  )
+  write.csv(perf, file="figs/ml_performance.csv", row.names=FALSE)
+  print(perf)
+}
+
+message("\nDone. Figures written to ./figs and caches to ./GDCdata")
+
+# ---------------------------
