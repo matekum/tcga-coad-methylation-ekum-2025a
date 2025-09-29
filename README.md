@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.1722394.svg)](https://doi.org/10.5281/zenodo.1722394)
+
 # TCGA–COAD methylation pipeline (Ekum 2025)
 
 Reproducible TCGA–COAD Illumina 450K DNA-methylation analysis:
@@ -13,3 +15,9 @@ surrogate-variable adjustment (SVA) → region-level DMR detection with
 2. From an R session:
    ```r
    source("scripts/tcga_coad_pipeline.R")
+
+## Citation
+If you use this pipeline, please cite:
+
+Matthew Iwada Ekum (2025). *TCGA-COAD methylation pipeline.*  
+Zenodo. [https://doi.org/10.5281/zenodo.1722394](https://doi.org/10.5281/zenodo.1722394)
