@@ -47,3 +47,14 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Local TCGA downloads and large caches
+GDCdata/
+*.rds
+*.RData
+*.Rds
+# Optional: keep figures small; remove this if you want PDFs tracked
+figs/*.pdf
+figs/*.png
+
+
