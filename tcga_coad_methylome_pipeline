@@ -5,32 +5,30 @@
 #   - EDA (density, PCA, heatmap)
 #   - Differential methylation analysis (limma)
 #   - Bumphunter DMR analysis
-#   - SVA adjustment and GAM smoothing
+#   - SVA adjustment + p-value kernel densities
+#   - GAM smoothing for locus visualisation
 #   - Cell composition analysis
-#   - Machine learning predictive modelling
+#   - Machine learning predictive modelling (PCA features)
+#   - Classification metrics: accuracy, precision, recall, F1, confusion matrix
+#   - ROC & PR curves, confusion-matrix heatmaps
 # Author: Dr. Matthew Iwada Ekum
-
-# NOTE: Ensure required Bioconductor and CRAN packages are installed before running.
 
 # ---------------------------
 #!/usr/bin/env Rscript
 ## tcga_coad_methylome_pipeline.R
-## End-to-end TCGA–COAD methylome analysis (EDA → limma → DMRs → SVA-lite → GAM → ML)
-## Outputs: ./figs/*.pdf, ./figs/ml_performance.csv, caches in ./GDCdata/*.rds
+## Outputs: ./figs/*.pdf|.png, ./figs/*.csv, caches in ./GDCdata/*.rds
 
 suppressPackageStartupMessages({
   if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-  for (p in c(
-    "TCGAbiolinks","SummarizedExperiment","GenomicRanges","IRanges",
-    "matrixStats","ggplot2","pheatmap","RColorBrewer","limma","dplyr","tibble",
-    "mgcv","irlba","bumphunter","ranger","xgboost","nnet","pROC","minfi"
-  )) { if (!requireNamespace(p, quietly = TRUE)) {
-      tryCatch({
-        if (p %in% c("TCGAbiolinks","SummarizedExperiment","GenomicRanges","IRanges","bumphunter","minfi"))
-          BiocManager::install(p, ask = FALSE, update = FALSE)
-        else install.packages(p)
-      }, error=function(e) message("Install hint for package ", p, ": ", e$message))
-  }}
+  pkgs_bioc <- c("TCGAbiolinks","SummarizedExperiment","GenomicRanges","IRanges",
+                 "bumphunter","minfi")
+  pkgs_cran <- c("matrixStats","ggplot2","pheatmap","RColorBrewer","limma","dplyr",
+                 "tibble","mgcv","irlba","ranger","xgboost","nnet","pROC",
+                 "yardstick","precrec","cowplot")
+  for (p in pkgs_bioc) if (!requireNamespace(p, quietly = TRUE))
+    try(BiocManager::install(p, ask = FALSE, update = FALSE), silent = TRUE)
+  for (p in pkgs_cran)  if (!requireNamespace(p, quietly = TRUE))
+    try(install.packages(p), silent = TRUE)
 })
 
 library(TCGAbiolinks)
@@ -50,6 +48,9 @@ library(ranger)
 library(xgboost)
 library(nnet)
 library(pROC)
+library(yardstick)
+library(precrec)
+library(cowplot)
 
 set.seed(123)
 options(stringsAsFactors = FALSE)
@@ -73,7 +74,8 @@ as_M <- function(beta, eps=1e-6) {
   beta <- pmin(pmax(beta, eps), 1 - eps)
   log2(beta/(1-beta))
 }
-save_pdf <- function(path, code) { pdf(path); on.exit(dev.off(), add=TRUE); force(code) }
+save_pdf <- function(path, code, w=7, h=5) { pdf(path, width=w, height=h); on.exit(dev.off(), add=TRUE); force(code) }
+save_png <- function(path, code, w=1400, h=1000, res=150) { png(path, width=w, height=h, res=res); on.exit(dev.off(), add=TRUE); force(code) }
 
 ## ---------------- 1) Data ----------------
 se_rds <- file.path("GDCdata","tcga_coad_450k_se.rds")
@@ -106,7 +108,7 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
 }
 
 ## ---------------- 2) EDA ----------------
-# 2.1 Density
+# 2.1 Density of beta-values
 {
   grid <- seq(0,1,length.out=256)
   cols_cs <- c(Normal="#1f77b4", Cancer="#d62728")
@@ -159,7 +161,7 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
   })
 }
 
-# 2.3 Heatmap (top 1000 CpGs)
+# 2.3 Heatmap (top 1000 CpGs; row z-scores)
 {
   vars <- rowVars(beta1); ord <- order(vars, decreasing=TRUE)
   k_hm <- min(1000L, length(ord))
@@ -205,7 +207,7 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
     )
   })
 
-  # Manhattan (if coordinates available)
+  # Manhattan (if coords available)
   coords <- try({
     rr <- rowRanges(se); tibble(CpG=names(rr),
                                 chr=as.character(seqnames(rr)),
@@ -284,7 +286,7 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
     save_pdf("figs/bumps.pdf", { plot.new(); title("Bumphunter regions"); text(.5,.5,"No regions detected.") })
   }
 
-  # Permutation null histogram
+  # Permutation null histogram (plus observed)
   null_vec <- NULL
   for (nm in c("null","nullDistribution","nullDist","null.value")) {
     if (!is.null(bh[[nm]])) { null_vec <- bh[[nm]]; break }
@@ -294,10 +296,12 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
   if (!is.null(null_vec)) {
     df_null <- data.frame(area = as.numeric(null_vec))
     save_pdf("figs/null.pdf", {
-      g <- ggplot(df_null, aes(area)) + geom_histogram(bins = max(20, min(80, length(null_vec)/2)),
-                                                       fill="grey75", color="grey35") +
+      g <- ggplot(df_null, aes(area)) +
+        geom_histogram(bins = max(20, min(80, length(null_vec)/2)),
+                       fill="grey75", color="grey35") +
         labs(title=sprintf("Permutation null of bump areas (B = %d)", B_perms),
-             x="Permutation max bump area", y="Count") + theme_minimal(base_size=12)
+             x="Permutation max bump area", y="Count") +
+        theme_minimal(base_size=12)
       if (is.finite(obs_area)) g <- g + geom_vline(xintercept = obs_area, color="#d62728", linewidth=1)
       print(g)
     })
@@ -305,7 +309,7 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
   assign("coords_df", coords, envir=.GlobalEnv)
 }
 
-## ---------------- 5) SVA-lite p-value hist ----------------
+## ---------------- 5) Fast SVA + p-value kernel densities ----------------
 {
   design <- model.matrix(~ CancerStatus, data=pheno)
   coef_idx <- which(colnames(design)=="CancerStatusCancer")
@@ -326,9 +330,24 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
   fit_post <- eBayes(lmFit(Mfull, cbind(design, SVs)), trend=TRUE, robust=TRUE)
   p_post   <- fit_post$p.value[,coef_idx]
 
+  # Kernel density plot (pre vs post SVA)
   dfp <- rbind(data.frame(p=p_pre, which="Pre-SV"),
                data.frame(p=p_post, which="Post-SV"))
   dfp <- subset(dfp, is.finite(p) & p>=0 & p<=1)
+  save_pdf("figs/p_kernel_pre_post_sva.pdf", w=7.5, h=5.5, {
+    print(
+      ggplot(dfp, aes(p, color=which, fill=which)) +
+        geom_density(alpha=.20, adjust=1) +
+        scale_color_manual(values=c("Pre-SV"="grey40","Post-SV"="#d62728")) +
+        scale_fill_manual(values=c("Pre-SV"="grey60","Post-SV"="#d62728")) +
+        coord_cartesian(xlim=c(0,1)) +
+        labs(x="p-value", y="Kernel density",
+             title="p-value distributions before and after fast SVA adjustment") +
+        theme_minimal(base_size=12) + theme(legend.position="top")
+    )
+  })
+
+  # (Optionally keep histogram version)
   save_pdf("figs/p_hist_pre_post_sva.pdf", {
     print(
       ggplot(dfp, aes(p, fill=which)) +
@@ -339,6 +358,10 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
         theme_minimal(base_size=12) + theme(legend.position="top")
     )
   })
+
+  # keep for downstream blocks
+  assign("p_pre", p_pre, envir=.GlobalEnv)
+  assign("p_post", p_post, envir=.GlobalEnv)
 }
 
 ## ---------------- 6) GAM locus visual ----------------
@@ -378,7 +401,6 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
 
 ## ---------------- 7) Cell composition (age effect) ----------------
 {
-  # Find an age column
   age_cols <- intersect(colnames(pheno),
                         c("paper_age_at_diagnosis","age_at_diagnosis","age_at_index","age","years_to_birth","paper_age"))
   if (length(age_cols)>0) {
@@ -387,7 +409,6 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
     keep <- is.finite(ph$Age)
     if (sum(keep) > 40) {
       beta_k <- beta[,keep,drop=FALSE]; M_k <- as_M(beta_k); ph_k <- ph[keep,,drop=FALSE]
-      # PC proxies if minfi deconv fails
       cell_frac <- NULL
       try({
         grSet <- minfi::makeGenomicRatioSetFromMatrix(beta_k, pData=ph_k, what="Beta",
@@ -409,7 +430,6 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
         cell_frac <- as.data.frame(pcs[,1:5,drop=FALSE]); colnames(cell_frac) <- paste0("PC",1:ncol(cell_frac))
         rownames(cell_frac) <- colnames(M_k)
       }
-      # pick CpGs with pre-adjust age association
       rv <- rowVars(M_k, na.rm=TRUE); ord <- order(rv, decreasing=TRUE); k <- min(5000L, length(ord))
       Msub <- M_k[ord[seq_len(k)],,drop=FALSE]; age_z <- scale(ph_k$Age)
       pre_p <- rep(NA_real_, nrow(Msub))
@@ -457,16 +477,15 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
   }
 }
 
-## ---------------- 8) Predictive modelling ----------------
+## ---------------- 8) Predictive modelling (PCA features) ----------------
 {
   # features = PCs (1..10); optional limma-score (not included in formal comparison table)
-  beta_all <- beta1  # from PCA stage
   pca2 <- prcomp(t(beta_top), center=TRUE, scale.=FALSE)  # reuse top matrix
   Xpc <- as.data.frame(pca2$x[,1:10,drop=FALSE]); colnames(Xpc) <- paste0("PC",1:ncol(Xpc))
   y <- factor(pheno1[rownames(Xpc),"CancerStatus",drop=TRUE], levels=c("Normal","Cancer"))
-  # limma-score
-  tt <- read.csv("figs/limma_per_cpg_results.csv", stringsAsFactors=FALSE)
-  rownames(tt) <- tt$CpG
+
+  # limma-score (interpretable signature; used only in RF here)
+  tt <- read.csv("figs/limma_per_cpg_results.csv", stringsAsFactors=FALSE); rownames(tt) <- tt$CpG
   M_full <- as_M(beta)
   sig_cpgs <- rownames(tt)[order(tt$adj.P.Val)][seq_len(min(100, nrow(tt)))]
   sig_cpgs <- sig_cpgs[sig_cpgs %in% rownames(M_full)]
@@ -491,7 +510,7 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
   auc_glm <- as.numeric(pROC::roc(yte, p_glm, quiet=TRUE)$auc)
   rmse_glm <- rmse(p_glm, yte_num); brier_glm <- mean((p_glm-yte_num)^2)
 
-  # Random Forest (PCs + score)
+  # Random Forest (PCs + limma score)
   xtr_pcl <- cbind(xtr, Xsig[train_idx,,drop=FALSE]); xte_pcl <- cbind(xte, Xsig[test_idx,,drop=FALSE])
   rf_fit <- ranger::ranger(dependent.variable.name="y",
                            data=data.frame(y=ytr, xtr_pcl),
@@ -528,8 +547,144 @@ if (!"CancerStatus" %in% names(pheno) && "sample_type" %in% names(pheno)) {
   )
   write.csv(perf, file="figs/ml_performance.csv", row.names=FALSE)
   print(perf)
+
+  # ---- 9) Classification metrics (accuracy, precision, recall, F1, AP, AUC) ----
+  positive_class <- "Cancer"
+  prob_cols <- c("prob_logit","prob_rf","prob_xgb","prob_nn")
+
+  preds <- data.frame(
+    truth     = yte,
+    prob_logit= p_glm,
+    prob_rf   = pr_rf,
+    prob_xgb  = p_xgb,
+    prob_nn   = p_nn,
+    check.names = FALSE
+  )
+  # Ensure positive is the 2nd level (yardstick expects event_level="second")
+  preds <- preds %>%
+    mutate(truth = factor(truth,
+                          levels = c(setdiff(levels(truth), positive_class), positive_class)))
+
+  compute_metrics_one <- function(data, truth_col, prob_col, pos, threshold = 0.5) {
+    neg <- setdiff(levels(data[[truth_col]]), pos)[1]
+    df <- data %>%
+      transmute(truth = .data[[truth_col]],
+                .prob  = .data[[prob_col]],
+                .pred  = factor(ifelse(.prob >= threshold, pos, neg),
+                                levels = c(neg, pos)))
+
+    acc  <- accuracy(df, truth, .pred) %>% dplyr::pull(.estimate)
+    prec <- precision(df, truth, .pred, event_level = "second") %>% dplyr::pull(.estimate)
+    rec  <- recall(df, truth, .pred, event_level = "second") %>% dplyr::pull(.estimate)
+    f1   <- f_meas(df, truth, .pred, event_level = "second") %>% dplyr::pull(.estimate)
+
+    auc_roc <- pROC::roc(response = df$truth, predictor = df$.prob,
+                         levels = levels(df$truth), direction = ">") %>%
+      pROC::auc() %>% as.numeric()
+
+    mm <- precrec::mmdata(scores = df$.prob, labels = as.integer(df$truth == pos))
+    ap <- precrec::auc(mm)$aucs %>% { .[.$curvetypes == "PRC","aucs"] } %>% as.numeric()
+
+    tibble(model = prob_col, threshold = threshold,
+           accuracy = acc, precision = prec, recall = rec, F1 = f1,
+           AUC_ROC = auc_roc, AP_PR = ap)
+  }
+
+  best_threshold_F1 <- function(data, truth_col, prob_col, pos, grid = seq(0.05,0.95,0.01)) {
+    neg <- setdiff(levels(data[[truth_col]]), pos)[1]
+    res <- sapply(grid, function(th) {
+      df <- transmute(data,
+                      truth = .data[[truth_col]],
+                      .pred = factor(ifelse(.data[[prob_col]] >= th, pos, neg),
+                                     levels = c(neg, pos)))
+      f_meas(df, truth, .pred, event_level = "second")$.estimate
+    })
+    grid[which.max(res)]
+  }
+
+  # Metrics at t = 0.5
+  metrics_t05 <- do.call(bind_rows, lapply(prob_cols, function(pc)
+    compute_metrics_one(preds, "truth", pc, positive_class, threshold = 0.5)))
+  write.csv(metrics_t05, "figs/ml_threshold_metrics_t0.5.csv", row.names = FALSE)
+
+  # Metrics at best-F1 thresholds
+  metrics_best <- do.call(bind_rows, lapply(prob_cols, function(pc) {
+    th <- best_threshold_F1(preds, "truth", pc, positive_class)
+    compute_metrics_one(preds, "truth", pc, positive_class, threshold = th)
+  }))
+  write.csv(metrics_best, "figs/ml_threshold_metrics_bestF1.csv", row.names = FALSE)
+
+  print(metrics_t05); print(metrics_best)
+
+  # ---- Confusion matrices + heatmaps ----
+  conf_mat_plot <- function(data, truth_col, prob_col, pos, threshold = 0.5, title = NULL) {
+    neg <- setdiff(levels(data[[truth_col]]), pos)[1]
+    df <- data %>%
+      transmute(truth = .data[[truth_col]],
+                .prob  = .data[[prob_col]],
+                .pred  = factor(ifelse(.prob >= threshold, pos, neg),
+                                levels = c(neg, pos)))
+    cm <- conf_mat(df, truth, .pred)
+    as_tibble(cm) %>%
+      ggplot(aes(x = Prediction, y = Truth, fill = n)) +
+      geom_tile() +
+      geom_text(aes(label = n), fontface = "bold") +
+      scale_x_discrete(position = "top") +
+      labs(title = title %||% paste0(prob_col, " (t=", threshold, ")"),
+           x = "Predicted", y = "True") +
+      theme_minimal(base_size = 12)
+  }
+
+  # At threshold 0.5
+  cm_plots_05 <- lapply(prob_cols, function(pc)
+    conf_mat_plot(preds, "truth", pc, positive_class, threshold = 0.5,
+                  title = paste0(pc, " (t=0.5)")))
+  save_pdf("figs/confusion_matrices_t05.pdf", w=10, h=8, {
+    print(plot_grid(plotlist = cm_plots_05, ncol = 2))
+  })
+
+  # At best-F1 thresholds
+  cm_plots_best <- lapply(prob_cols, function(pc) {
+    th <- best_threshold_F1(preds, "truth", pc, positive_class)
+    conf_mat_plot(preds, "truth", pc, positive_class, threshold = th,
+                  title = paste0(pc, " (best F1 t=", sprintf("%.2f", th), ")"))
+  })
+  save_pdf("figs/confusion_matrices_bestF1.pdf", w=10, h=8, {
+    print(plot_grid(plotlist = cm_plots_best, ncol = 2))
+  })
+
+  # ---- Precision–Recall and ROC curves (with AP/AUC in legend) ----
+  make_pr_data <- function(data, truth_col, prob_cols, pos) {
+    scores <- as.matrix(data[, prob_cols, drop = FALSE])
+    labels <- as.integer(data[[truth_col]] == pos)
+    precrec::mmdata(scores = scores, labels = labels, modnames = prob_cols)
+  }
+  mm <- make_pr_data(preds, "truth", prob_cols, positive_class)
+  ev <- precrec::evalmod(mm)
+
+  # AP labels for legend
+  ap_tbl <- precrec::auc(ev) %>% dplyr::filter(curvetypes == "PRC") %>%
+    dplyr::select(modnames, aucs) %>%
+    dplyr::mutate(label = paste0(modnames, " (AP=", sprintf("%.3f", aucs), ")"))
+  lab_map <- setNames(ap_tbl$label, ap_tbl$modnames)
+
+  pr_plot <- autoplot(ev, curvetypes = "PRC") +
+    theme_minimal(base_size = 12) +
+    labs(title = "Precision–Recall Curves", x = "Recall", y = "Precision") +
+    scale_colour_discrete(labels = lab_map)
+
+  auc_tbl <- precrec::auc(ev) %>% dplyr::filter(curvetypes == "ROC") %>%
+    dplyr::select(modnames, aucs) %>%
+    dplyr::mutate(label = paste0(modnames, " (AUC=", sprintf("%.3f", aucs), ")"))
+  lab_map_roc <- setNames(auc_tbl$label, auc_tbl$modnames)
+
+  roc_plot <- autoplot(ev, curvetypes = "ROC") +
+    theme_minimal(base_size = 12) +
+    labs(title = "ROC Curves", x = "False Positive Rate", y = "True Positive Rate") +
+    scale_colour_discrete(labels = lab_map_roc)
+
+  save_pdf("figs/pr_curves.pdf",  { print(pr_plot)  })
+  save_pdf("figs/roc_curves.pdf", { print(roc_plot) })
 }
 
 message("\nDone. Figures written to ./figs and caches to ./GDCdata")
-
-# ---------------------------
